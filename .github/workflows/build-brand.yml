@@ -1,0 +1,169 @@
+# Fabrica el launcher propio de un studio (su nombre, su icono, sus colores) y lo publica en
+# la release `brand-<id>` de este repo, de donde también se actualiza solo.
+#
+# Lo lanza el panel (Launchers → Compilar) o build.yml al publicar una versión nueva de Onyx.
+# Mismas reglas que build.yml: el código viene del repo privado y su salida nunca se publica.
+# La ficha de la marca (nombre, icono, colores...) es pública: la sirve el panel.
+#
+# Las releases de marca son "prerelease" y nunca "latest": así Onyx Client nunca se confunde
+# y se actualiza a un launcher de marca.
+#
+# Secreto: SOURCE_TOKEN (el mismo que build.yml).
+name: Launcher de marca
+run-name: Marca ${{ inputs.brand }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      brand:
+        description: 'Id de la marca'
+        required: true
+      ref:
+        description: 'Rama, tag o commit de onyx-client'
+        default: 'main'
+      platforms:
+        description: 'windows,linux,macos'
+        default: 'windows,linux,macos'
+
+permissions: {}
+
+concurrency:
+  group: brand-${{ inputs.brand }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PANEL: https://panel.onyxclient.site
+  BRAND: ${{ inputs.brand }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.src.outputs.sha }}
+      version: ${{ steps.src.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Marca
+        run: |
+          set -euo pipefail
+          [[ "$BRAND" =~ ^[a-z][a-z0-9-]{1,31}$ ]] || { echo "::error::Id de marca no válido"; exit 1; }
+          curl -fsS "$PANEL/api/public/brands/$BRAND/build" > brand.json || { echo "::error::El panel no tiene esta marca o no está permitida"; exit 1; }
+          jq -e '.brand.id and .brand.name' brand.json > /dev/null
+          echo "Fabricando: $(jq -r .brand.name brand.json)"
+
+      - name: Código
+        id: src
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || { echo "::error::ref no válido"; exit 1; }
+          git init -q src
+          git -C src -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo "password=$SOURCE_TOKEN"; }; f' \
+            fetch -q --depth 1 https://github.com/kewinnsinhoo/onyx-client.git "$REF"
+          git -C src checkout -q FETCH_HEAD
+          echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "require('./src/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Release de la marca (se crea si no existe)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="brand-$BRAND"
+          NAME=$(jq -r .brand.name brand.json)
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --prerelease --latest=false \
+              --title "$NAME" --notes "Instaladores de $NAME (con la tecnología de Onyx Client)." > /dev/null
+          fi
+
+      - id: matrix
+        env:
+          P: ${{ inputs.platforms }}
+        run: |
+          OS=()
+          [[ "$P" == *windows* ]] && OS+=('"windows-latest"')
+          [[ "$P" == *linux* ]] && OS+=('"ubuntu-latest"')
+          [[ "$P" == *macos* ]] && OS+=('"macos-latest"')
+          [ ${#OS[@]} -gt 0 ] || { echo "::error::Sin plataformas"; exit 1; }
+          echo "matrix={\"os\":[$(IFS=,; echo "${OS[*]}")]}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Código
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git init -q src
+          git -C src -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo "password=$SOURCE_TOKEN"; }; f' \
+            fetch -q --depth 1 https://github.com/kewinnsinhoo/onyx-client.git "$SHA"
+          git -C src checkout -q FETCH_HEAD
+      - name: Aplicar la marca
+        working-directory: src
+        env:
+          RELEASES_REPO: ${{ github.repository }}
+        run: node scripts/brand.js "$PANEL/api/public/brands/$BRAND/build"
+      - name: Dependencias
+        working-directory: src
+        run: |
+          npm install --no-audit --no-fund > "$RUNNER_TEMP/npm.log" 2>&1 \
+            || { echo "::error::npm install ha fallado"; grep -iE "error" "$RUNNER_TEMP/npm.log" | tail -20; exit 1; }
+      - name: Compilar
+        working-directory: src
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          ARGS=""; [ "$RUNNER_OS" = macOS ] && ARGS="--mac"
+          npx electron-builder $ARGS --publish never > "$RUNNER_TEMP/build.log" 2>&1 \
+            || { echo "::error::La compilación ha fallado"; grep -iE "error|cannot|failed" "$RUNNER_TEMP/build.log" | tail -25; exit 1; }
+      - name: Subir a la release brand-${{ inputs.brand }}
+        working-directory: src/dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          BIN=( *.exe *.exe.blockmap *.dmg *.dmg.blockmap *.zip *.zip.blockmap *.AppImage )
+          YML=( latest*.yml )
+          [ ${#BIN[@]} -gt 0 ] || { echo "::error::No salió ningún instalador"; exit 1; }
+          # Primero los instaladores y después latest*.yml: nadie ve una actualización sin su archivo
+          gh release upload "brand-$BRAND" "${BIN[@]}" -R "$GITHUB_REPOSITORY" --clobber
+          [ ${#YML[@]} -eq 0 ] || gh release upload "brand-$BRAND" "${YML[@]}" -R "$GITHUB_REPOSITORY" --clobber
+          printf '%s\n' "${BIN[@]}" "${YML[@]}"
+
+  clean:
+    needs: [prepare, build]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      V: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Quitar instaladores de versiones anteriores
+        run: |
+          gh release view "brand-$BRAND" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | while read -r f; do
+            case "$f" in latest*.yml|*"$V"*) ;; *) gh release delete-asset "brand-$BRAND" "$f" -R "$GITHUB_REPOSITORY" -y > /dev/null && echo "Quitado $f" ;; esac
+          done
