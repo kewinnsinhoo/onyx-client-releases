@@ -1,7 +1,6 @@
-# Onyx Client · descargas
+# Onyx Client — descargas (ya no se usa)
 
-Aquí se publican los instaladores de **Onyx Client** y de los launchers propios de los studios
-(«con la tecnología de Onyx Client»). El código no está aquí.
+Las descargas de Onyx Client están ahora en **https://github.com/kewinnsinhoo/onyx-client/releases**
+y en **https://onyxclient.site/download**.
 
-- Descargar Onyx Client: https://onyxclient.site/download.html
-- Releases `vX.Y.Z`: Onyx Client. Releases `brand-<id>`: el launcher de cada studio.
+Este repo ya no compila ni publica nada.
